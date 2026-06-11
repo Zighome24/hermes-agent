@@ -25,7 +25,15 @@ def load_plugin(monkeypatch):
 
 
 def runtime(mod):
-    cfg = mod.PiObservabilityConfig(server_url="http://127.0.0.1:9", token="tok", pool="pool-a", tags=("hermes", "test"))
+    cfg = mod.PiObservabilityConfig(
+        server_url="http://127.0.0.1:9",
+        token="tok",
+        pool="pool-a",
+        tags=("hermes", "test"),
+        capture_content=True,
+        capture_tool_args=True,
+        capture_tool_results=True,
+    )
     sender = FakeSender()
     rt = mod.PiObservabilityRuntime(cfg, sender=sender)
     mod._RUNTIME = rt
@@ -94,6 +102,28 @@ def test_usage_and_cost_mapping_from_hermes_summary(monkeypatch):
     }
 
 
+def test_usage_mapping_sums_multi_call_usage(monkeypatch):
+    mod = load_plugin(monkeypatch)
+
+    usage = mod.normalize_usage(
+        {
+            "responses": [
+                {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15, "cost_total": 0.01},
+                {"input_tokens": 2, "output_tokens": 3, "cache_read_tokens": 4, "cost_total": 0.02},
+            ]
+        }
+    )
+
+    assert usage == {
+        "input": 12,
+        "output": 8,
+        "cache_read": 4,
+        "cache_write": 0,
+        "total_tokens": 24,
+        "cost_total": 0.03,
+    }
+
+
 def test_sender_posts_batched_events_and_auth_header(monkeypatch):
     mod = load_plugin(monkeypatch)
     captured = {}
@@ -134,7 +164,9 @@ def test_sender_posts_batched_events_and_auth_header(monkeypatch):
 
 def test_sender_fail_open_on_unreachable_server(monkeypatch):
     mod = load_plugin(monkeypatch)
-    cfg = mod.PiObservabilityConfig(server_url="http://127.0.0.1:9", timeout_s=0.05, batch_size=1)
+    cfg = mod.PiObservabilityConfig(
+        server_url="http://127.0.0.1:9", timeout_s=0.05, batch_size=1, debug_sent_batches=True
+    )
     sender = mod.EventSender(cfg)
     try:
         sender._post_batch([{"event_id": "e1"}])
@@ -142,6 +174,58 @@ def test_sender_fail_open_on_unreachable_server(monkeypatch):
         sender.close(drain=False)
 
     assert sender.sent_batches == [[{"event_id": "e1"}]]
+
+
+def test_sender_close_drain_posts_queued_events(monkeypatch):
+    mod = load_plugin(monkeypatch)
+    posted = []
+    monkeypatch.setattr(mod, "_post_events", lambda _cfg, batch: posted.append(list(batch)))
+    cfg = mod.PiObservabilityConfig(server_url="http://127.0.0.1:9", batch_size=10, batch_interval_s=10)
+    sender = mod.EventSender(cfg)
+
+    sender.send({"event_id": "e1"})
+    sender.send({"event_id": "e2"})
+    sender.close(drain=True)
+
+    assert posted == [[{"event_id": "e1"}, {"event_id": "e2"}]]
+
+
+def test_sent_batches_retained_only_in_debug_mode(monkeypatch):
+    mod = load_plugin(monkeypatch)
+    monkeypatch.setattr(mod, "_post_events", lambda _cfg, _batch: None)
+    normal = mod.EventSender(mod.PiObservabilityConfig(server_url="http://127.0.0.1:9", batch_size=1))
+    debug = mod.EventSender(
+        mod.PiObservabilityConfig(server_url="http://127.0.0.1:9", batch_size=1, debug_sent_batches=True)
+    )
+    try:
+        normal._post_batch([{"event_id": "e1"}])
+        debug._post_batch([{"event_id": "e1"}])
+    finally:
+        normal.close(drain=False)
+        debug.close(drain=False)
+
+    assert normal.sent_batches == []
+    assert debug.sent_batches == [[{"event_id": "e1"}]]
+
+
+def test_insecure_plain_http_with_token_is_disabled(monkeypatch):
+    mod = load_plugin(monkeypatch)
+    monkeypatch.setenv("HERMES_PI_OBS_SERVER_URL", "http://example.com:43190")
+    monkeypatch.setenv("HERMES_PI_OBS_TOKEN", "tok")
+
+    cfg = mod.load_config_from_env()
+
+    assert cfg.enabled is False
+
+
+def test_local_plain_http_with_token_is_allowed(monkeypatch):
+    mod = load_plugin(monkeypatch)
+    monkeypatch.setenv("HERMES_PI_OBS_SERVER_URL", "http://127.0.0.1:43190")
+    monkeypatch.setenv("HERMES_PI_OBS_TOKEN", "tok")
+
+    cfg = mod.load_config_from_env()
+
+    assert cfg.enabled is True
 
 
 def test_registers_required_hooks(monkeypatch):
@@ -218,3 +302,46 @@ def test_tool_error_result_emits_error_event(monkeypatch):
 
     assert [event["type"] for event in sender.events][-2:] == ["tool_result", "error"]
     assert sender.events[-1]["payload"]["where"] == "tool:terminal"
+
+
+def test_tool_result_payload_parses_json_string_result(monkeypatch):
+    mod = load_plugin(monkeypatch)
+    _rt, sender = runtime(mod)
+
+    mod.on_post_tool_call(
+        session_id="s1",
+        tool_call_id="tc1",
+        tool_name="terminal",
+        result='{"stdout":"bad","exit_code":2,"error":"failed"}',
+    )
+
+    payload = sender.events[-2]["payload"]
+    assert payload["content_text"] == "bad"
+    assert payload["details_summary"]["exit_code"] == 2
+    assert payload["is_error"] is True
+
+
+def test_privacy_controls_omit_prompt_args_and_result_by_default(monkeypatch):
+    mod = load_plugin(monkeypatch)
+    cfg = mod.PiObservabilityConfig(server_url="http://127.0.0.1:9", token="tok")
+    sender = FakeSender()
+    mod._RUNTIME = mod.PiObservabilityRuntime(cfg, sender=sender)
+
+    mod.on_pre_llm_call(session_id="s1", user_message="secret prompt")
+    mod.on_pre_tool_call(session_id="s1", tool_call_id="tc1", tool_name="terminal", args={"token": "secret"})
+    mod.on_post_tool_call(
+        session_id="s1",
+        tool_call_id="tc1",
+        tool_name="terminal",
+        result='{"stdout":"secret output","exit_code":0,"error":"secret error"}',
+    )
+
+    agent_start = next(event for event in sender.events if event["type"] == "agent_start")
+    tool_call = next(event for event in sender.events if event["type"] == "tool_call")
+    tool_result = next(event for event in sender.events if event["type"] == "tool_result")
+
+    assert "prompt" not in agent_start["payload"]
+    assert agent_start["payload"]["prompt_length"] == len("secret prompt")
+    assert tool_call["payload"]["args"] == {"_omitted": "tool argument capture disabled"}
+    assert tool_result["payload"]["content_text"] == ""
+    assert "error" not in tool_result["payload"].get("details_summary", {})

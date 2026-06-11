@@ -8,6 +8,7 @@ on the configured pi-observability server.
 from __future__ import annotations
 
 import atexit
+import hashlib
 import json
 import logging
 import os
@@ -44,6 +45,11 @@ class PiObservabilityConfig:
     batch_size: int = 25
     batch_interval_s: float = 0.5
     enabled: bool = True
+    capture_content: bool = False
+    capture_tool_args: bool = False
+    capture_tool_results: bool = False
+    debug_sent_batches: bool = False
+    allow_insecure_http_with_token: bool = False
 
 
 @dataclass
@@ -67,12 +73,13 @@ class EventSender:
         self.config = config
         self._queue: queue.Queue[dict[str, Any] | None] = queue.Queue(maxsize=max(1, config.queue_max))
         self._stopped = threading.Event()
-        self.sent_batches: list[list[dict[str, Any]]] = []  # useful for tests/subclasses
+        self._closing = threading.Event()
+        self.sent_batches: list[list[dict[str, Any]]] = []
         self._thread = threading.Thread(target=self._run, name="hermes-pi-observability", daemon=True)
         self._thread.start()
 
     def send(self, event: dict[str, Any]) -> None:
-        if not self.config.enabled:
+        if not self.config.enabled or self._closing.is_set():
             return
         try:
             self._queue.put_nowait(event)
@@ -80,26 +87,30 @@ class EventSender:
             logger.debug("pi-observability queue full; dropping event")
 
     def close(self, *, drain: bool = True) -> None:
-        if self._stopped.is_set():
+        if self._closing.is_set():
             return
-        self._stopped.set()
-        if drain:
+        self._closing.set()
+        if not drain:
+            self._stopped.set()
+        deadline = time.monotonic() + max(0.1, self.config.timeout_s + 0.5)
+        while True:
             try:
-                self._queue.put_nowait(None)
+                self._queue.put(None, timeout=0.05)
+                break
             except queue.Full:
-                pass
-            self._thread.join(timeout=max(0.1, self.config.timeout_s + 0.2))
+                if not drain or time.monotonic() >= deadline:
+                    self._stopped.set()
+                    break
+        self._thread.join(timeout=max(0.1, self.config.timeout_s + self.config.batch_interval_s + 0.5))
 
     def _run(self) -> None:
         batch: list[dict[str, Any]] = []
         deadline = time.monotonic() + self.config.batch_interval_s
-        while not self._stopped.is_set():
+        while True:
             timeout = max(0.0, deadline - time.monotonic())
             try:
                 item = self._queue.get(timeout=timeout)
             except queue.Empty:
-                item = None
-            if item is None:
                 if batch:
                     self._post_batch(batch)
                     batch = []
@@ -107,6 +118,10 @@ class EventSender:
                 if self._stopped.is_set():
                     break
                 continue
+            if item is None:
+                if batch:
+                    self._post_batch(batch)
+                break
             batch.append(item)
             if len(batch) >= self.config.batch_size:
                 self._post_batch(batch)
@@ -114,7 +129,9 @@ class EventSender:
                 deadline = time.monotonic() + self.config.batch_interval_s
 
     def _post_batch(self, batch: list[dict[str, Any]]) -> None:
-        self.sent_batches.append(list(batch))
+        if self.config.debug_sent_batches:
+            self.sent_batches.append(list(batch))
+            del self.sent_batches[:-20]
         try:
             _post_events(self.config, batch)
         except Exception as exc:  # pragma: no cover - fail-open network path
@@ -167,11 +184,15 @@ class PiObservabilityRuntime:
         if not state.agent_started:
             state.agent_started = True
             prompt = _prompt_from_kwargs(kwargs)
-            self.emit(
-                "agent_start",
-                {"prompt": prompt, "images_count": _images_count(kwargs), "session_id": state.session_id},
-                kwargs,
-            )
+            payload = {
+                "images_count": _images_count(kwargs),
+                "session_id": state.session_id,
+                "prompt_length": len(prompt),
+                "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest() if prompt else "",
+            }
+            if self.config.capture_content:
+                payload["prompt"] = prompt
+            self.emit("agent_start", payload, kwargs)
 
     def start_turn(self, kwargs: dict[str, Any]) -> None:
         self.ensure_started(kwargs)
@@ -215,7 +236,7 @@ def _env_bool(*names: str, default: bool = True) -> bool:
 def load_config_from_env() -> PiObservabilityConfig:
     tags_raw = _env("HERMES_PI_OBS_TAGS", "OBS_TAGS", default="hermes")
     tags = tuple(tag.strip() for tag in tags_raw.split(",") if tag.strip()) or ("hermes",)
-    return PiObservabilityConfig(
+    cfg = PiObservabilityConfig(
         server_url=_env("HERMES_PI_OBS_SERVER_URL", "OBS_SERVER_URL", default="http://127.0.0.1:43190").rstrip("/"),
         token=_env("HERMES_PI_OBS_TOKEN", "OBS_TOKEN"),
         pool=_env("HERMES_PI_OBS_POOL", "OBS_POOL", default="hermes"),
@@ -226,7 +247,18 @@ def load_config_from_env() -> PiObservabilityConfig:
         batch_size=_int_env("HERMES_PI_OBS_BATCH_SIZE", "OBS_BATCH_SIZE", default=25),
         batch_interval_s=_float_env("HERMES_PI_OBS_BATCH_INTERVAL_S", "OBS_BATCH_INTERVAL_S", default=0.5),
         enabled=_env_bool("HERMES_PI_OBS_ENABLED", "OBS_ENABLED", default=True),
+        capture_content=_env_bool("HERMES_PI_OBS_CAPTURE_CONTENT", "OBS_CAPTURE_CONTENT", default=False),
+        capture_tool_args=_env_bool("HERMES_PI_OBS_CAPTURE_TOOL_ARGS", "OBS_CAPTURE_TOOL_ARGS", default=False),
+        capture_tool_results=_env_bool("HERMES_PI_OBS_CAPTURE_TOOL_RESULTS", "OBS_CAPTURE_TOOL_RESULTS", default=False),
+        debug_sent_batches=_env_bool("HERMES_PI_OBS_DEBUG_SENT_BATCHES", "OBS_DEBUG_SENT_BATCHES", default=False),
+        allow_insecure_http_with_token=_env_bool(
+            "HERMES_PI_OBS_ALLOW_INSECURE_HTTP", "OBS_ALLOW_INSECURE_HTTP", default=False
+        ),
     )
+    if cfg.token and not _token_url_allowed(cfg):
+        logger.warning("pi-observability disabled: refusing to send bearer token to non-local plain HTTP URL %s", cfg.server_url)
+        cfg = PiObservabilityConfig(**{**cfg.__dict__, "enabled": False})
+    return cfg
 
 
 def _int_env(*names: str, default: int) -> int:
@@ -252,6 +284,8 @@ def _get_runtime() -> PiObservabilityRuntime:
 
 
 def _post_events(config: PiObservabilityConfig, events: list[dict[str, Any]]) -> None:
+    if config.token and not _token_url_allowed(config):
+        raise ValueError("refusing to send bearer token to non-local plain HTTP pi-observability URL")
     url = urllib.parse.urljoin(config.server_url + "/", "events")
     data = json.dumps(events, separators=(",", ":")).encode("utf-8")
     headers = {"Content-Type": "application/json"}
@@ -296,6 +330,16 @@ def _envelope(
 def normalize_usage(usage: Any = None, response: Any = None, **kwargs: Any) -> dict[str, Any]:
     raw = usage if usage is not None else _value(response, "usage", {})
     data = _jsonable(raw) if raw is not None else {}
+    items = _usage_items(data)
+    if len(items) > 1:
+        totals = {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "total_tokens": 0, "cost_total": 0.0}
+        for item in items:
+            normalized = normalize_usage(item, **kwargs)
+            for key in ("input", "output", "cache_read", "cache_write", "total_tokens"):
+                totals[key] += int(normalized.get(key) or 0)
+            totals["cost_total"] += float(normalized.get("cost_total") or 0.0)
+        return totals
+    data = items[0] if items else {}
     if not isinstance(data, dict):
         data = {}
     input_tokens = _first_int(data, "input", "input_tokens", "prompt_tokens")
@@ -314,6 +358,33 @@ def normalize_usage(usage: Any = None, response: Any = None, **kwargs: Any) -> d
         "total_tokens": total,
         "cost_total": float(cost_total or 0.0),
     }
+
+
+def _usage_items(data: Any) -> list[dict[str, Any]]:
+    if isinstance(data, list):
+        return [item for item in data if isinstance(item, dict)]
+    if not isinstance(data, dict):
+        return []
+    for key in ("calls", "responses", "items", "usages", "usage_summaries"):
+        value = data.get(key)
+        if isinstance(value, list):
+            return [item for item in value if isinstance(item, dict)]
+    nested = data.get("usage")
+    if isinstance(nested, dict) and not any(
+        key in data
+        for key in (
+            "input",
+            "input_tokens",
+            "prompt_tokens",
+            "output",
+            "output_tokens",
+            "completion_tokens",
+            "total",
+            "total_tokens",
+        )
+    ):
+        return [nested]
+    return [data]
 
 
 def _estimate_cost(kwargs: dict[str, Any], input_tokens: int, output_tokens: int, cache_read: int, cache_write: int) -> float:
@@ -419,7 +490,9 @@ def _stop_reason(kwargs: dict[str, Any]) -> str:
     return str(reason)
 
 
-def _tool_args(args: Any) -> tuple[dict[str, Any], bool]:
+def _tool_args(args: Any, config: PiObservabilityConfig) -> tuple[dict[str, Any], bool]:
+    if not config.capture_tool_args:
+        return {"_omitted": "tool argument capture disabled"}, False
     value = _jsonable(args if args is not None else {})
     if not isinstance(value, dict):
         value = {"value": value}
@@ -429,16 +502,42 @@ def _tool_args(args: Any) -> tuple[dict[str, Any], bool]:
     return {"_truncated": True, "preview": _truncate_text(encoded, MAX_ARGS_BYTES)[0]}, True
 
 
-def _tool_result_payload(result: Any) -> tuple[str, bool, dict[str, Any]]:
+def _tool_result_payload(result: Any, config: PiObservabilityConfig) -> tuple[str, bool, dict[str, Any]]:
     value = _jsonable(result)
+    if isinstance(value, str):
+        parsed = _json_from_string(value)
+        if parsed is not None:
+            value = _jsonable(parsed)
     if isinstance(value, dict):
         text = str(value.get("content") or value.get("text") or value.get("stdout") or value.get("result") or "")
-        details = {k: v for k, v in value.items() if k in {"exit_code", "status", "error", "duration_ms"}}
+        details = {k: _safe_detail(k, v) for k, v in value.items() if k in {"exit_code", "status", "error", "duration_ms"}}
     else:
         text = value if isinstance(value, str) else json.dumps(value, default=str)
         details = {}
+    if not config.capture_tool_results:
+        return "", False, {k: v for k, v in details.items() if k != "error"}
     truncated_text, truncated = _truncate_text(text, MAX_RESULT_BYTES)
     return truncated_text, truncated, details
+
+
+def _json_from_string(value: str) -> Any:
+    stripped = value.strip()
+    if not stripped or stripped[0] not in "[{\"":
+        return None
+    try:
+        return json.loads(stripped)
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_detail(key: str, value: Any) -> Any:
+    if key.lower() in {"token", "api_key", "apikey", "authorization", "password", "secret"}:
+        return "[redacted]"
+    if isinstance(value, str):
+        return _truncate_text(value, 1024)[0]
+    if isinstance(value, (int, float, bool)) or value is None:
+        return value
+    return _truncate_text(json.dumps(_jsonable(value), default=str, separators=(",", ":")), 1024)[0]
 
 
 def _truncate_text(text: str, max_bytes: int) -> tuple[str, bool]:
@@ -487,6 +586,14 @@ def _str_or_none(value: Any) -> Optional[str]:
     return str(value) if value else None
 
 
+def _token_url_allowed(config: PiObservabilityConfig) -> bool:
+    parsed = urllib.parse.urlparse(config.server_url)
+    if parsed.scheme != "http" or config.allow_insecure_http_with_token:
+        return True
+    host = (parsed.hostname or "").lower()
+    return host in {"127.0.0.1", "localhost", "::1"}
+
+
 def _safe(fn) -> None:
     try:
         fn()
@@ -511,8 +618,8 @@ def on_post_api_request(**kwargs: Any) -> None:
         usage = normalize_usage(**kwargs)
         state = runtime.ensure_session(kwargs)
         payload = {
-            "text": _assistant_text(kwargs),
-            "thinking": str(kwargs.get("reasoning") or ""),
+            "text": _assistant_text(kwargs) if runtime.config.capture_content else "",
+            "thinking": str(kwargs.get("reasoning") or "") if runtime.config.capture_content else "",
             "tool_call_ids": _assistant_tool_ids(kwargs),
             "stop_reason": _stop_reason(kwargs),
             "usage": usage,
@@ -542,7 +649,7 @@ def on_pre_tool_call(**kwargs: Any) -> None:
     runtime = _get_runtime()
 
     def _record() -> None:
-        args, truncated = _tool_args(kwargs.get("args"))
+        args, truncated = _tool_args(kwargs.get("args"), runtime.config)
         runtime.emit(
             "tool_call",
             {
@@ -561,7 +668,7 @@ def on_post_tool_call(**kwargs: Any) -> None:
     runtime = _get_runtime()
 
     def _record() -> None:
-        content, truncated, details = _tool_result_payload(kwargs.get("result"))
+        content, truncated, details = _tool_result_payload(kwargs.get("result"), runtime.config)
         status = kwargs.get("status")
         is_error = bool(kwargs.get("is_error") or status == "error" or (isinstance(details.get("exit_code"), int) and details["exit_code"] != 0))
         payload: dict[str, Any] = {
@@ -575,7 +682,8 @@ def on_post_tool_call(**kwargs: Any) -> None:
             payload["details_summary"] = details
         runtime.emit("tool_result", payload, kwargs)
         if is_error:
-            runtime.emit("error", {"message": content[:500], "where": f"tool:{payload['tool_name']}"}, kwargs)
+            message = content[:500] if runtime.config.capture_tool_results else "tool call failed"
+            runtime.emit("error", {"message": message, "where": f"tool:{payload['tool_name']}"}, kwargs)
 
     _safe(_record)
 
