@@ -1992,11 +1992,28 @@ def list_jobs(include_disabled: bool = False) -> List[Dict[str, Any]]:
     return jobs
 
 
+def _has_renewed_recurring_budget(job: Dict[str, Any]) -> bool:
+    """A preserved finite counter may be renewed by an explicit repeat increase.
+
+    Do not resurrect one-shots, exhausted budgets, unlimited terminal records,
+    malformed counters, or error states. Schedule/authorization checks still run.
+    """
+    repeat = job.get('repeat')
+    if not isinstance(repeat, dict):
+        return False
+    times, completed = repeat.get('times'), repeat.get('completed')
+    return (job.get('state') == 'completed'
+            and (job.get('schedule') or {}).get('kind') in {'cron', 'interval'}
+            and type(times) is int and type(completed) is int
+            and 0 <= completed < times)
+
+
 def _reject_terminal_activation(job: Dict[str, Any], updated: Dict[str, Any], job_id: str) -> None:
-    """A genuinely terminal job cannot be reactivated through update_job (use cron resume)."""
+    """Keep terminal guards unless a finite recurring budget was explicitly renewed."""
     if (
         is_terminal_job(job)
         and not _is_recoverable_error_job(job)
+        and not _has_renewed_recurring_budget(job)
         and (
             updated.get("state") not in {"completed", "error"}
             or updated.get("enabled") is True
